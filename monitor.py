@@ -8,6 +8,7 @@ import re
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from urllib import request
+import requests
 
 import yaml
 import jpholiday
@@ -32,11 +33,22 @@ def discord_notify(webhook: str, message: str) -> None:
         print("[notify skipped] DISCORD_WEBHOOK_URL is not set")
         print(message)
         return
-    payload = json.dumps({"content": message}, ensure_ascii=False).encode("utf-8")
-    req = request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
-    with request.urlopen(req, timeout=20) as resp:
-        if resp.status >= 300:
-            raise RuntimeError(f"Discord webhook failed: HTTP {resp.status}")
+
+    resp = requests.post(
+        webhook,
+        json={"content": message},
+        headers={
+            "User-Agent": "MachidaTennisWatcher/1.0",
+            "Accept": "application/json",
+        },
+        timeout=20,
+    )
+
+    if resp.status_code >= 300:
+        body = resp.text[:500]
+        raise RuntimeError(
+            f"Discord webhook failed: HTTP {resp.status_code} body={body}"
+        )
 
 
 def load_state() -> set[str]:

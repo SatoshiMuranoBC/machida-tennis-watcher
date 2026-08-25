@@ -83,57 +83,49 @@ async def click_next(page: Page) -> None:
 
 
 async def select_facilities(page: Page, facility_keywords: list[str]) -> None:
-    """Select matching facility checkboxes/radios or links on the facility-selection page."""
-    body = normalize(await page.locator("body").inner_text())
-    missing = [k for k in facility_keywords if k not in body]
-    if missing:
-        print(f"[warning] facility keywords not visible on first page: {missing}")
+    """Select requested facilities, following the site's facility-list pagination.
 
-    picked = 0
-    # Prefer labels associated with checkboxes/radios.
-    for keyword in facility_keywords:
-        labels = page.locator("label", has_text=keyword)
-        for i in range(await labels.count()):
-            label = labels.nth(i)
-            try:
-                await label.click()
-                picked += 1
-            except Exception:
-                pass
+    Machida's legacy ASP.NET screen renders each facility as an
+    ``input[type=submit]`` whose *value* is the facility name.  It is not a
+    checkbox in the DOM, so body text / checkbox selectors do not see it.
+    The list is also split across pages (e.g. 野津田公園北 is on page 2).
+    """
+    remaining = list(dict.fromkeys(facility_keywords))
+    selected: list[str] = []
 
-    # If no labels worked, click row-local checkbox/radio beside matching text.
-    if picked == 0:
-        for keyword in facility_keywords:
-            textloc = page.get_by_text(keyword, exact=False)
-            for i in range(await textloc.count()):
-                el = textloc.nth(i)
-                try:
-                    row = el.locator("xpath=ancestor::tr[1]")
-                    ctrl = row.locator("input[type=checkbox], input[type=radio]").first
-                    if await ctrl.count():
-                        await ctrl.check()
-                        picked += 1
-                        break
-                except Exception:
-                    pass
+    for _ in range(10):  # safety cap for facility-list pagination
+        # The facility controls expose their value as the accessible button name.
+        for keyword in remaining[:]:
+            loc = page.get_by_role("button", name=keyword, exact=True)
+            if await loc.count():
+                await loc.first.click()
+                await page.wait_for_timeout(150)
+                selected.append(keyword)
+                remaining.remove(keyword)
+                print(f"[selected] {keyword}")
 
-    # Some pages use a select list instead.
-    if picked == 0:
-        selects = page.locator("select")
-        for i in range(await selects.count()):
-            sel = selects.nth(i)
-            opts = await sel.locator("option").all_text_contents()
-            for keyword in facility_keywords:
-                for opt in opts:
-                    if keyword in normalize(opt):
-                        try:
-                            await sel.select_option(label=opt)
-                            picked += 1
-                        except Exception:
-                            pass
+        if not remaining:
+            break
 
-    if picked == 0 and facility_keywords:
-        raise RuntimeError("指定施設を選択できませんでした。施設名を config.yml で短めの部分一致にしてください。")
+        # Some target facilities are on the next facility-list page.
+        next_page = page.locator("#btnNextPage:not([disabled])")
+        if not await next_page.count():
+            break
+
+        before = await page.locator("#lblPage").inner_text() if await page.locator("#lblPage").count() else ""
+        await next_page.click()
+        await page.wait_for_load_state("networkidle")
+        after = await page.locator("#lblPage").inner_text() if await page.locator("#lblPage").count() else ""
+        print(f"[facility page] {before} -> {after}")
+
+    if remaining:
+        raise RuntimeError(
+            "指定施設を選択できませんでした: " + ", ".join(remaining) +
+            "。debug/01_facility.* を確認してください。"
+        )
+
+    if not selected and facility_keywords:
+        raise RuntimeError("指定施設を1件も選択できませんでした。")
 
 
 async def set_date_if_possible(page: Page, target: datetime) -> None:

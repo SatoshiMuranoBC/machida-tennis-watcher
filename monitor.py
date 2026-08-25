@@ -443,6 +443,18 @@ def fingerprint(row: str) -> str:
 
 async def main() -> None:
     cfg = load_config()
+
+    # Manual notification test. This is only triggered when the workflow
+    # explicitly sets TEST_NOTIFICATION=1.
+    if os.getenv("TEST_NOTIFICATION", "0") == "1":
+        discord_notify(
+            os.getenv("DISCORD_WEBHOOK_URL", ""),
+            "🎾 **町田市テニス空き監視：テスト通知**\n"
+            "GitHub Actions からDiscordへの通知に成功しました。"
+        )
+        print("[test] Discord test notification sent")
+        return
+
     rows = await check_once(cfg)
     current = {fingerprint(r): r for r in rows}
     seen = load_state()

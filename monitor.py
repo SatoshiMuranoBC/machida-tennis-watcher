@@ -289,15 +289,15 @@ async def inspect_page(page: Page, label: str) -> None:
 
 
 
-async def choose_two_week_view(page: Page) -> None:
-    """Use a 2-week result grid so the configured 14-day horizon fits on one screen."""
-    btn = page.locator("#rbtnTwoWeek")
+async def choose_month_view(page: Page) -> None:
+    """Use the site's 1-month result grid for a 30-day monitoring horizon."""
+    btn = page.locator("#rbtnMonth")
     if await btn.count():
         cls = (await btn.get_attribute("class")) or ""
         if "Orange" not in cls:
             await btn.click()
             await page.wait_for_load_state("networkidle")
-            print("[period] 2週間")
+            print("[period] 1ヶ月")
 
 
 def _date_from_event_href(href: str) -> date | None:
@@ -316,7 +316,7 @@ async def select_candidate_days(page: Page, cfg: dict, start: date) -> int:
     The next screen contains time-slot detail. We deliberately include △ here,
     because a partially-open day may still have the requested 19:00-21:00 slot.
     """
-    horizon = start + timedelta(days=int(cfg.get("days_ahead", 14)))
+    horizon = start + timedelta(days=int(cfg.get("days_ahead", 30)))
     targets: list[str] = []
     anchors = page.locator('a[href*="$dgTable$"]')
     # Older ASP.NET renders $ as encoded/plain depending on Playwright; fall back broadly.
@@ -406,8 +406,8 @@ async def check_once(cfg: dict) -> list[str]:
         await select_facilities(page, cfg.get("facility_keywords", []))
         await click_next(page)
 
-        # Date-selection screen: request a 2-week grid to match days_ahead=14.
-        await choose_two_week_view(page)
+        # Date-selection screen: request a 1-month grid for the 30-day horizon.
+        await choose_month_view(page)
         await inspect_page(page, "02_after_facility")
 
         today = datetime.now().date()

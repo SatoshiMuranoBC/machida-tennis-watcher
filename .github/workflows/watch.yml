@@ -2,11 +2,17 @@ name: Machida Tennis Watch
 
 on:
   workflow_dispatch:
+    inputs:
+      test_notification:
+        description: "Discordへテスト通知だけ送る"
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "*/10 * * * *"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   watch:
@@ -14,23 +20,32 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - run: pip install -r requirements.txt
+
       - run: playwright install --with-deps chromium
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_notification != true }}
+
       - name: Restore state
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_notification != true }}
         uses: actions/cache@v4
         with:
           path: state.json
           key: machida-tennis-state-${{ github.run_id }}
           restore-keys: |
             machida-tennis-state-
+
       - name: Check availability
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           HEADLESS: "1"
+          TEST_NOTIFICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.test_notification == true && '1' || '0' }}
         run: python monitor.py
+
       - name: Upload debug screenshots on failure
         if: failure()
         uses: actions/upload-artifact@v4

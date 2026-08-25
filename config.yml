@@ -7,7 +7,7 @@ facility_keywords:
   - "野津田公園北テニスコート"
 
 # 今日から何日先までを監視対象にするか
-days_ahead: 14
+days_ahead: 30
 
 # 希望日時
 schedule:

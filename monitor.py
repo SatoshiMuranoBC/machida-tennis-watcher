@@ -288,8 +288,111 @@ async def inspect_page(page: Page, label: str) -> None:
     (DEBUG_DIR / f"{label}.txt").write_text(await page.locator("body").inner_text(), encoding="utf-8")
 
 
+
+async def choose_two_week_view(page: Page) -> None:
+    """Use a 2-week result grid so the configured 14-day horizon fits on one screen."""
+    btn = page.locator("#rbtnTwoWeek")
+    if await btn.count():
+        cls = (await btn.get_attribute("class")) or ""
+        if "Orange" not in cls:
+            await btn.click()
+            await page.wait_for_load_state("networkidle")
+            print("[period] 2週間")
+
+
+def _date_from_event_href(href: str) -> date | None:
+    m = re.search(r"b(20\\d{6})", href or "")
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+async def select_candidate_days(page: Page, cfg: dict, start: date) -> int:
+    """Select day cells that have at least some availability (○/△) within horizon.
+
+    The next screen contains time-slot detail. We deliberately include △ here,
+    because a partially-open day may still have the requested 19:00-21:00 slot.
+    """
+    horizon = start + timedelta(days=int(cfg.get("days_ahead", 14)))
+    targets: list[str] = []
+    anchors = page.locator('a[href*="$dgTable$"]')
+    # Older ASP.NET renders $ as encoded/plain depending on Playwright; fall back broadly.
+    if not await anchors.count():
+        anchors = page.locator('a[href*="dgTable"]')
+    for i in range(await anchors.count()):
+        a = anchors.nth(i)
+        txt = normalize(await a.inner_text())
+        if txt not in {"○", "△"}:
+            continue
+        href = (await a.get_attribute("href")) or ""
+        d = _date_from_event_href(href)
+        if d and start <= d <= horizon:
+            targets.append(href)
+
+    # De-duplicate while preserving order.
+    targets = list(dict.fromkeys(targets))
+    selected = 0
+    for href in targets:
+        loc = page.locator(f'a[href="{href}"]')
+        if not await loc.count():
+            continue
+        try:
+            await loc.first.click()
+            await page.wait_for_timeout(120)
+            selected += 1
+        except Exception as e:
+            print(f"[warning] day select failed: {href}: {e}")
+    print(f"[candidate days] selected={selected}")
+    return selected
+
+
+async def scrape_time_detail(page: Page, cfg: dict) -> list[str]:
+    """Conservative parser for the time-detail screen.
+
+    Only reports rows/blocks where a concrete date and time range can be tied to
+    an availability mark. This avoids false notifications from the legend text.
+    """
+    today = datetime.now().date()
+    out: list[str] = []
+    facility_keywords = cfg.get("facility_keywords", [])
+
+    # Table rows first.
+    rows = page.locator("tr")
+    for i in range(await rows.count()):
+        row = rows.nth(i)
+        txt = normalize(await row.inner_text())
+        if not txt or not any(t in txt for t in ["○", "△"]):
+            continue
+        if not _extract_time_ranges(txt):
+            continue
+
+        # Pull a little surrounding table context so a facility/date in a nearby
+        # header can be associated with the slot row.
+        table = row.locator("xpath=ancestor::table[1]")
+        context = txt
+        if await table.count():
+            ttxt = normalize(await table.inner_text())
+            if len(ttxt) <= 3000:
+                context = ttxt
+        if facility_keywords and not any(k in context for k in facility_keywords):
+            # Some pages put facility in a preceding heading; use nearby parent text.
+            parent = row.locator("xpath=ancestor::*[self::div or self::td][1]")
+            if await parent.count():
+                ptxt = normalize(await parent.inner_text())
+                if len(ptxt) <= 3000:
+                    context = ptxt + " | " + txt
+        if not matches_requested_schedule(context, cfg, today=today):
+            continue
+        if facility_keywords and not any(k in context for k in facility_keywords):
+            continue
+        out.append(context)
+
+    return sorted(set(out))
+
 async def check_once(cfg: dict) -> list[str]:
-    days_ahead = int(cfg.get("days_ahead", 14))
     headless = os.getenv("HEADLESS", "1") != "0"
 
     async with async_playwright() as p:
@@ -302,28 +405,36 @@ async def check_once(cfg: dict) -> list[str]:
         await inspect_page(page, "01_facility")
         await select_facilities(page, cfg.get("facility_keywords", []))
         await click_next(page)
+
+        # Date-selection screen: request a 2-week grid to match days_ahead=14.
+        await choose_two_week_view(page)
         await inspect_page(page, "02_after_facility")
 
-        all_rows: list[str] = []
-        today = datetime.now()
-        # The site commonly shows a date range at once. We try the start date first, then parse all visible availability.
-        await set_date_if_possible(page, today)
-        try:
-            await click_next(page)
-        except Exception:
-            # Some flows already display availability after facility selection.
-            pass
+        today = datetime.now().date()
+        await set_date_if_possible(page, datetime.now())
+        await click_next(page)
         await inspect_page(page, "03_results")
-        all_rows.extend(await scrape_available_rows(page, cfg))
 
-        # Date filters are applied textually after scraping when possible.
-        wanted_dates = {(today + timedelta(days=i)).strftime(fmt) for i in range(days_ahead + 1) for fmt in ["%-m/%-d", "%m/%d"]}
-        filtered = [r for r in all_rows if any(d in r for d in wanted_dates)]
-        if filtered:
-            all_rows = filtered
+        # The facility result grid is only day-level. △ means some time slots are
+        # available, so drill down into all ○/△ days in the configured horizon.
+        selected = await select_candidate_days(page, cfg, today)
+        if selected == 0:
+            await browser.close()
+            return []
 
+        # Use the page footer's forward button, not an individual facility's
+        # "次へ >>" link.
+        forward = page.locator("#ucPCFooter_btnForward")
+        if await forward.count():
+            await forward.click()
+            await page.wait_for_load_state("networkidle")
+        else:
+            await click_next(page)
+
+        await inspect_page(page, "04_time_detail")
+        rows = await scrape_time_detail(page, cfg)
         await browser.close()
-        return sorted(set(all_rows))
+        return rows
 
 
 def fingerprint(row: str) -> str:

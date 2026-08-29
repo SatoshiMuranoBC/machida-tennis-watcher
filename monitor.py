@@ -313,7 +313,7 @@ async def choose_month_view(page: Page) -> None:
 
 
 def _date_from_event_href(href: str) -> date | None:
-    m = re.search(r"b(20\\d{6})", href or "")
+    m = re.search(r"b(20\d{6})", href or "")
     if not m:
         return None
     try:

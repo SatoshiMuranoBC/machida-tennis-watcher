@@ -322,18 +322,16 @@ def _date_from_event_href(href: str) -> date | None:
         return None
 
 
-async def select_candidate_days(page: Page, cfg: dict, start: date) -> int:
-    """Select day cells that have at least some availability (○/△) within horizon.
+async def collect_candidate_hrefs(page: Page, cfg: dict, start: date) -> list[str]:
+    """Collect all ○/△ facility-date cells in the monitoring horizon.
 
-    The next screen contains time-slot detail. We deliberately include △ here,
-    because a partially-open day may still have the requested 19:00-21:00 slot.
+    The Machida site allows at most 20 selected cells at once, so callers must
+    process these hrefs in batches of 20 or fewer.
     """
     horizon = start + timedelta(days=int(cfg.get("days_ahead", 30)))
     targets: list[str] = []
-    anchors = page.locator('a[href*="$dgTable$"]')
-    # Older ASP.NET renders $ as encoded/plain depending on Playwright; fall back broadly.
-    if not await anchors.count():
-        anchors = page.locator('a[href*="dgTable"]')
+    anchors = page.locator('a[href*="dgTable"]')
+
     for i in range(await anchors.count()):
         a = anchors.nth(i)
         txt = normalize(await a.inner_text())
@@ -344,12 +342,22 @@ async def select_candidate_days(page: Page, cfg: dict, start: date) -> int:
         if d and start <= d <= horizon:
             targets.append(href)
 
-    # De-duplicate while preserving order.
+    # Each href includes the facility ctlXX + date, so do NOT collapse by date.
     targets = list(dict.fromkeys(targets))
+    print(f"[candidate cells] total={len(targets)} (site max selection=20)")
+    return targets
+
+
+async def select_candidate_batch(page: Page, hrefs: list[str]) -> int:
+    """Select one batch of candidate facility-date cells (max 20)."""
+    if len(hrefs) > 20:
+        raise ValueError("candidate batch must be <= 20")
+
     selected = 0
-    for href in targets:
+    for href in hrefs:
         loc = page.locator(f'a[href="{href}"]')
         if not await loc.count():
+            print(f"[warning] candidate disappeared before selection: {href}")
             continue
         try:
             await loc.first.click()
@@ -357,7 +365,8 @@ async def select_candidate_days(page: Page, cfg: dict, start: date) -> int:
             selected += 1
         except Exception as e:
             print(f"[warning] day select failed: {href}: {e}")
-    print(f"[candidate days] selected={selected}")
+
+    print(f"[candidate batch] requested={len(hrefs)} selected={selected}")
     return selected
 
 
@@ -404,11 +413,24 @@ async def scrape_time_detail(page: Page, cfg: dict) -> list[str]:
 
     return sorted(set(out))
 
+async def _open_results_page(page: Page, cfg: dict) -> None:
+    """Navigate from the tennis entry page to the 1-month facility result grid."""
+    await page.goto(BASE_URL, wait_until="networkidle")
+    await select_facilities(page, cfg.get("facility_keywords", []))
+    await click_next(page)
+
+    await choose_month_view(page)
+    await set_date_if_possible(page, datetime.now())
+    await click_next(page)
+
+
 async def check_once(cfg: dict) -> list[str]:
     headless = os.getenv("HEADLESS", "1") != "0"
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
+
+        # First pass: discover every ○/△ facility-date cell.
         context = await browser.new_context(locale="ja-JP", timezone_id="Asia/Tokyo")
         page = await context.new_page()
         page.set_default_timeout(15000)
@@ -417,8 +439,6 @@ async def check_once(cfg: dict) -> list[str]:
         await inspect_page(page, "01_facility")
         await select_facilities(page, cfg.get("facility_keywords", []))
         await click_next(page)
-
-        # Date-selection screen: request a 1-month grid for the 30-day horizon.
         await choose_month_view(page)
         await inspect_page(page, "02_after_facility")
 
@@ -427,26 +447,54 @@ async def check_once(cfg: dict) -> list[str]:
         await click_next(page)
         await inspect_page(page, "03_results")
 
-        # The facility result grid is only day-level. △ means some time slots are
-        # available, so drill down into all ○/△ days in the configured horizon.
-        selected = await select_candidate_days(page, cfg, today)
-        if selected == 0:
+        targets = await collect_candidate_hrefs(page, cfg, today)
+        await context.close()
+
+        if not targets:
             await browser.close()
+            print("[result] no ○/△ candidate cells")
             return []
 
-        # Use the page footer's forward button, not an individual facility's
-        # "次へ >>" link.
-        forward = page.locator("#ucPCFooter_btnForward")
-        if await forward.count():
-            await forward.click()
-            await page.wait_for_load_state("networkidle")
-        else:
-            await click_next(page)
+        # IMPORTANT: the Machida site caps selection at 20 cells.
+        # Process all candidates in chunks so later facilities (especially
+        # 野津田公園北) are not silently omitted.
+        all_rows: list[str] = []
+        batch_size = 20
+        batches = [targets[i:i + batch_size] for i in range(0, len(targets), batch_size)]
+        print(f"[candidate batches] count={len(batches)}")
 
-        await inspect_page(page, "04_time_detail")
-        rows = await scrape_time_detail(page, cfg)
+        for batch_no, batch in enumerate(batches, 1):
+            context = await browser.new_context(locale="ja-JP", timezone_id="Asia/Tokyo")
+            page = await context.new_page()
+            page.set_default_timeout(15000)
+
+            await _open_results_page(page, cfg)
+            selected = await select_candidate_batch(page, batch)
+            if selected == 0:
+                await context.close()
+                continue
+
+            forward = page.locator("#ucPCFooter_btnForward")
+            if await forward.count():
+                await forward.click()
+                await page.wait_for_load_state("networkidle")
+            else:
+                await click_next(page)
+
+            # Keep per-batch diagnostics if a run has to be inspected later.
+            await inspect_page(page, f"04_time_detail_batch{batch_no}")
+            rows = await scrape_time_detail(page, cfg)
+            print(f"[batch {batch_no}] matched_rows={len(rows)}")
+            for r in rows:
+                print(f"[matched] {r[:800]}")
+            all_rows.extend(rows)
+
+            await context.close()
+
         await browser.close()
-        return rows
+        deduped = sorted(set(all_rows))
+        print(f"[result] matched_total={len(deduped)}")
+        return deduped
 
 
 def fingerprint(row: str) -> str:

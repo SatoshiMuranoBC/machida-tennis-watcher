@@ -51,19 +51,30 @@ def discord_notify(webhook: str, message: str) -> None:
         )
 
 
-def load_state() -> set[str]:
+STATE_FORMAT_VERSION = 2
+
+
+def load_state() -> tuple[set[str], int]:
     if not STATE_FILE.exists():
-        return set()
+        return set(), 0
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return set(data.get("seen", []))
+        return set(data.get("seen", [])), int(data.get("format_version", 1))
     except Exception:
-        return set()
+        return set(), 0
 
 
 def save_state(keys: set[str]) -> None:
     STATE_FILE.write_text(
-        json.dumps({"seen": sorted(keys), "updated_at": datetime.now().isoformat()}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "format_version": STATE_FORMAT_VERSION,
+                "seen": sorted(keys),
+                "updated_at": datetime.now().isoformat(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -370,48 +381,164 @@ async def select_candidate_batch(page: Page, hrefs: list[str]) -> int:
     return selected
 
 
-async def scrape_time_detail(page: Page, cfg: dict) -> list[str]:
-    """Conservative parser for the time-detail screen.
+def _slot_matches_schedule(slot_date: date, start_time: time, end_time: time, cfg: dict) -> bool:
+    schedule = cfg.get("schedule", {})
+    is_dayoff = slot_date.weekday() >= 5 or jpholiday.is_holiday(slot_date)
 
-    Only reports rows/blocks where a concrete date and time range can be tied to
-    an availability mark. This avoids false notifications from the legend text.
+    if is_dayoff:
+        return schedule.get("weekends_and_holidays", {}).get("all_day", True)
+
+    for item in schedule.get("weekdays", {}).get("time_ranges", []):
+        if start_time == _parse_hhmm(item["start"]) and end_time == _parse_hhmm(item["end"]):
+            return True
+    return False
+
+
+def _slot_record(
+    facility: str,
+    slot_date: date,
+    court: str,
+    start_time: time,
+    end_time: time,
+    status: str,
+) -> str:
+    """Stable machine-readable representation used for state comparison."""
+    return json.dumps(
+        {
+            "facility": facility,
+            "date": slot_date.isoformat(),
+            "court": court,
+            "start": start_time.strftime("%H:%M"),
+            "end": end_time.strftime("%H:%M"),
+            "status": status,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _parse_time_detail_text(raw_text: str, cfg: dict) -> list[str]:
+    """Parse the time-detail page into one record per actually available court/time slot.
+
+    The previous implementation returned a whole surrounding table as one result,
+    which made notifications enormous and could mix dates together.  This parser
+    treats each facility/date/court/time as an independent slot.
     """
+    text = normalize(raw_text)
+    facilities = list(dict.fromkeys(cfg.get("facility_keywords", [])))
+    if not text or not facilities:
+        return []
+
+    facility_re = re.compile("|".join(sorted((re.escape(x) for x in facilities), key=len, reverse=True)))
+    facility_matches = list(facility_re.finditer(text))
+    if not facility_matches:
+        return []
+
+    # Machida's detail screen uses labels such as Ａ面, Ｂ面, ...
+    court_re = re.compile(r"([Ａ-ＺA-Z０-９0-9一二三四五六七八九十]+面)\s+")
+    results: list[str] = []
     today = datetime.now().date()
-    out: list[str] = []
-    facility_keywords = cfg.get("facility_keywords", [])
 
-    # Table rows first.
-    rows = page.locator("tr")
-    for i in range(await rows.count()):
-        row = rows.nth(i)
-        txt = normalize(await row.inner_text())
-        if not txt or not any(t in txt for t in ["○", "△"]):
-            continue
-        if not _extract_time_ranges(txt):
+    for idx, fm in enumerate(facility_matches):
+        block_end = facility_matches[idx + 1].start() if idx + 1 < len(facility_matches) else len(text)
+        block = text[fm.start():block_end]
+        facility = fm.group(0)
+        slot_date = _extract_date(block, today)
+        if slot_date is None:
             continue
 
-        # Pull a little surrounding table context so a facility/date in a nearby
-        # header can be associated with the slot row.
-        table = row.locator("xpath=ancestor::table[1]")
-        context = txt
-        if await table.count():
-            ttxt = normalize(await table.inner_text())
-            if len(ttxt) <= 3000:
-                context = ttxt
-        if facility_keywords and not any(k in context for k in facility_keywords):
-            # Some pages put facility in a preceding heading; use nearby parent text.
-            parent = row.locator("xpath=ancestor::*[self::div or self::td][1]")
-            if await parent.count():
-                ptxt = normalize(await parent.inner_text())
-                if len(ptxt) <= 3000:
-                    context = ptxt + " | " + txt
-        if not matches_requested_schedule(context, cfg, today=today):
+        court_matches = list(court_re.finditer(block))
+        if not court_matches:
             continue
-        if facility_keywords and not any(k in context for k in facility_keywords):
-            continue
-        out.append(context)
 
-    return sorted(set(out))
+        # Time headings are printed before the first court row, e.g.
+        # 9:00～ 11:00 11:00～ 13:00 ...
+        header = block[:court_matches[0].start()]
+        time_ranges = _extract_time_ranges(header)
+        if not time_ranges:
+            continue
+
+        for court_idx, cm in enumerate(court_matches):
+            body_end = court_matches[court_idx + 1].start() if court_idx + 1 < len(court_matches) else len(block)
+            body = block[cm.end():body_end]
+            tokens = body.split()
+            if not tokens:
+                continue
+
+            # First cell after the court name is the capacity column (often '－').
+            # The next N cells correspond to the N time ranges in the header.
+            statuses = tokens[1:1 + len(time_ranges)]
+            if len(statuses) < len(time_ranges):
+                print(
+                    f"[warning] status columns short: {facility} {slot_date} {cm.group(1)} "
+                    f"times={len(time_ranges)} statuses={len(statuses)}"
+                )
+
+            for (start_time, end_time), status in zip(time_ranges, statuses):
+                if status not in {"○", "△"}:
+                    continue
+                if not _slot_matches_schedule(slot_date, start_time, end_time, cfg):
+                    continue
+                results.append(
+                    _slot_record(
+                        facility,
+                        slot_date,
+                        cm.group(1),
+                        start_time,
+                        end_time,
+                        status,
+                    )
+                )
+
+    return sorted(set(results))
+
+
+async def scrape_time_detail(page: Page, cfg: dict) -> list[str]:
+    raw_text = await page.locator("body").inner_text()
+    return _parse_time_detail_text(raw_text, cfg)
+
+
+def _format_slot_group(records: list[dict]) -> list[str]:
+    weekdays = "月火水木金土日"
+    lines: list[str] = []
+
+    # Group by facility + date while keeping chronological order.
+    records = sorted(records, key=lambda r: (r["date"], r["facility"], r["start"], r["court"]))
+    current_key = None
+    for r in records:
+        d = datetime.strptime(r["date"], "%Y-%m-%d").date()
+        key = (r["facility"], r["date"])
+        if key != current_key:
+            if lines:
+                lines.append("")
+            lines.append(f'**{r["facility"]}**')
+            lines.append(f'📅 {d.month}/{d.day}（{weekdays[d.weekday()]}）')
+            current_key = key
+
+        status_label = "空き" if r.get("status") == "○" else "条件付き"
+        lines.append(f'・{r["court"]}　{r["start"]}〜{r["end"]}　{r["status"]} {status_label}')
+
+    return lines
+
+
+def _build_notification_messages(records: list[dict]) -> list[str]:
+    """Build Discord messages without exceeding Discord's 2000-character limit."""
+    header = f"🎾 **町田市テニスコート 空き通知**\n新しい空き：{len(records)}件\n"
+    footer = "\n🔗 [予約サイトを開く](https://www.pf489.com/machida/)"
+    body_lines = _format_slot_group(records)
+
+    messages: list[str] = []
+    current = header
+    for line in body_lines:
+        addition = line + "\n"
+        if len(current) + len(addition) + len(footer) > 1900:
+            messages.append(current.rstrip() + footer)
+            current = "🎾 **空き通知（続き）**\n" + addition
+        else:
+            current += addition
+    messages.append(current.rstrip() + footer)
+    return messages
 
 async def _open_results_page(page: Page, cfg: dict) -> None:
     """Navigate from the tennis entry page to the 1-month facility result grid."""
@@ -517,19 +644,29 @@ async def main() -> None:
 
     rows = await check_once(cfg)
     current = {fingerprint(r): r for r in rows}
-    seen = load_state()
-    new_keys = set(current) - seen
+    seen, state_version = load_state()
+
+    # v2 changes state granularity from a whole page/table to one individual slot.
+    # When upgrading an existing installation, silently establish a new baseline once
+    # instead of sending a large one-off notification for every currently open slot.
+    if state_version not in {0, STATE_FORMAT_VERSION}:
+        print(f"[state] migrating format v{state_version} -> v{STATE_FORMAT_VERSION}; baseline reset")
+        new_keys: set[str] = set()
+    else:
+        new_keys = set(current) - seen
 
     print(f"available={len(rows)} new={len(new_keys)}")
     for row in rows:
-        print("-", row)
+        try:
+            r = json.loads(row)
+            print(f'- {r["facility"]} {r["date"]} {r["court"]} {r["start"]}-{r["end"]} {r["status"]}')
+        except Exception:
+            print("-", row)
 
     if new_keys:
-        lines = ["🎾 **町田市テニスコートに空きが見つかりました**", ""]
-        for key in sorted(new_keys):
-            lines.append(f"• {current[key]}")
-        lines += ["", "予約サイト:", "https://www.pf489.com/machida/"]
-        discord_notify(os.getenv("DISCORD_WEBHOOK_URL", ""), "\n".join(lines)[:1900])
+        new_records = [json.loads(current[key]) for key in sorted(new_keys)]
+        for message in _build_notification_messages(new_records):
+            discord_notify(os.getenv("DISCORD_WEBHOOK_URL", ""), message)
 
     # Keep only currently available keys. If a slot fills and later reopens, it will notify again.
     save_state(set(current))

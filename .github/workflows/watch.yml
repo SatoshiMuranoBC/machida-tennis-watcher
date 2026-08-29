@@ -16,6 +16,7 @@ jobs:
   watch:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -44,10 +45,11 @@ jobs:
           TEST_NOTIFICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.test_notification == true && '1' || '0' }}
         run: python monitor.py
 
-      - name: Upload debug screenshots on failure
-        if: failure()
+      - name: Upload debug screenshots
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug
+          name: debug-${{ github.run_id }}
           path: debug/
           if-no-files-found: ignore
+          retention-days: 3

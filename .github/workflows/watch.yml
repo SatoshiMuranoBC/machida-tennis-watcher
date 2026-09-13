@@ -24,10 +24,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - run: playwright install --with-deps chromium
+      - name: Install Playwright
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_notification != true }}
+        run: playwright install --with-deps chromium
 
       - name: Restore state
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_notification != true }}
@@ -45,8 +47,8 @@ jobs:
           TEST_NOTIFICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.test_notification == true && '1' || '0' }}
         run: python monitor.py
 
-      - name: Upload debug screenshots
-        if: always()
+      - name: Upload debug screenshots on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: debug-${{ github.run_id }}
